@@ -1,0 +1,104 @@
+/// Installer for the TMobile TMOHS1 hotspot.
+///
+/// Tested on (from `/etc/wt_version`):
+///   WT_INNER_VERSION=SW_Q89527AA1_V045_M11_TMO_USR_MP
+///   WT_PRODUCTION_VERSION=TMOHS1_00.05.20
+///   WT_HARDWARE_VERSION=89527_1_11
+use std::net::SocketAddr;
+use std::str::FromStr;
+use std::time::Duration;
+
+use anyhow::Result;
+use tokio::time::sleep;
+
+use crate::TmobileArgs as Args;
+use crate::output::{print, println};
+use crate::util::{reboot_device, telnet_send_command, telnet_send_file};
+use crate::wingtech::start_telnet;
+
+pub async fn install(
+    Args {
+        admin_ip,
+        admin_password,
+    }: Args,
+) -> Result<()> {
+    run_install(admin_ip, admin_password).await
+}
+
+async fn run_install(admin_ip: String, admin_password: String) -> Result<()> {
+    print!("Starting telnet ... ");
+    start_telnet(&admin_ip, &admin_password).await?;
+    sleep(Duration::from_millis(200)).await;
+    println!("ok");
+
+    print!("Connecting via telnet to {admin_ip} ... ");
+    let addr = SocketAddr::from_str(&format!("{admin_ip}:23")).unwrap();
+    telnet_send_command(addr, "mkdir -p /data/rayhunter", "exit code 0", true).await?;
+    println!("ok");
+
+    telnet_send_command(addr, "mount -o remount,rw /", "exit code 0", true).await?;
+
+    telnet_send_file(
+        addr,
+        "/data/rayhunter/config.toml",
+        crate::CONFIG_TOML
+            .replace("#device = \"orbic\"", "device = \"tmobile\"")
+            .as_bytes(),
+        true,
+    )
+    .await?;
+
+    let rayhunter_daemon_bin = crate::get_file!("FILE_RAYHUNTER_DAEMON");
+    telnet_send_file(
+        addr,
+        "/data/rayhunter/rayhunter-daemon",
+        rayhunter_daemon_bin,
+        true,
+    )
+    .await?;
+    telnet_send_command(
+        addr,
+        "chmod 755 /data/rayhunter/rayhunter-daemon",
+        "exit code 0",
+        true,
+    )
+    .await?;
+    telnet_send_file(
+        addr,
+        "/etc/init.d/misc-daemon",
+        include_bytes!("../../dist/scripts/misc-daemon"),
+        true,
+    )
+    .await?;
+    telnet_send_command(
+        addr,
+        "chmod 755 /etc/init.d/misc-daemon",
+        "exit code 0",
+        true,
+    )
+    .await?;
+    telnet_send_file(
+        addr,
+        "/etc/init.d/rayhunter_daemon",
+        crate::RAYHUNTER_DAEMON_INIT.as_bytes(),
+        true,
+    )
+    .await?;
+    telnet_send_command(
+        addr,
+        "chmod 755 /etc/init.d/rayhunter_daemon",
+        "exit code 0",
+        true,
+    )
+    .await?;
+
+    reboot_device(addr, "reboot", &admin_ip).await;
+
+    println!();
+    println!("Note: by default the TMOHS1 shuts off Wi-Fi after 10 minutes with no clients,");
+    println!("which blocks remote access to Rayhunter until you power cycle. To keep");
+    println!("Wi-Fi always on, open http://{admin_ip}/ -> Settings -> Sleep and set");
+    println!("Wi-Fi Standby to \"Always on\". See doc/tmobile-tmohs1.md for steps.");
+
+    Ok(())
+}

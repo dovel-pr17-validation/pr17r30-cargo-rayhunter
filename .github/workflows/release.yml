@@ -1,0 +1,53 @@
+# To learn how to use this workflow, please read CONTRIBUTING.md.
+name: Release rayhunter
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  check_version_same:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Ensure all Cargo.toml files have the same version defined.
+        run: |
+          defined_versions=$(find lib check daemon installer installer-gui rootshell telcom-parser -name Cargo.toml -exec grep ^version {} \; | sort -u | wc -l)
+          find lib check daemon installer installer-gui rootshell telcom-parser -name Cargo.toml -exec grep ^version {} \;
+          echo number of defined versions = $defined_versions
+          if [ $defined_versions != "1" ]
+          then
+            echo "all Cargo.toml files must have the same version defined"
+            exit 1
+          fi
+
+  main:
+    needs: check_version_same
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+      pages: write
+    uses: ./.github/workflows/main.yml
+
+  release:
+    runs-on: ubuntu-latest
+    needs: main
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+      - name: Create release
+        run: |
+          version=$(grep ^version lib/Cargo.toml | cut -d' ' -f3 | tr -d '"')
+          gh release create --generate-notes -t "Rayhunter v$version" "v$version" rayhunter-v${version}-*/rayhunter-v${version}*.zi*

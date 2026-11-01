@@ -1,0 +1,785 @@
+use std::ops::DerefMut;
+use std::pin::pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
+use futures::{StreamExt, TryStreamExt, future};
+use log::{debug, error, info, warn};
+use rayhunter::Device;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use crate::gps::GpsRecord;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{RwLock, oneshot};
+use tokio_stream::wrappers::LinesStream;
+use tokio_util::task::TaskTracker;
+
+use rayhunter::DeviceMetadata;
+#[cfg(feature = "apidocs")]
+use rayhunter::analysis::analyzer::ReportMetadata;
+use rayhunter::analysis::analyzer::{AnalysisLineNormalizer, AnalyzerConfig, EventType};
+use rayhunter::diag::{DataType, Message, MessagesContainer};
+use rayhunter::diag_device::DiagDevice;
+use rayhunter::qmdl::QmdlWriter;
+
+use crate::analysis::{AnalysisCtrlMessage, AnalysisWriter};
+use crate::config::GpsMode;
+use crate::display;
+use crate::notifications::{Notification, NotificationType};
+use crate::qmdl_store::{FileKind, RecordingStore, RecordingStoreError};
+use crate::server::ServerState;
+use crate::stats::DiskStats;
+
+const DISK_CHECK_BYTES_INTERVAL: usize = 256 * 1024;
+
+pub enum DiagDeviceCtrlMessage {
+    StopRecording,
+    StartRecording {
+        response_tx: Option<oneshot::Sender<Result<(), RecordingStoreError>>>,
+    },
+    DeleteEntry {
+        name: String,
+        response_tx: oneshot::Sender<Result<(), RecordingStoreError>>,
+    },
+    DeleteAllEntries {
+        response_tx: oneshot::Sender<Result<(), RecordingStoreError>>,
+    },
+    GpsUpdate {
+        lat: f64,
+        lon: f64,
+    },
+    Exit,
+}
+
+pub struct DiagTask {
+    ui_update_sender: Sender<display::DisplayState>,
+    analysis_sender: Sender<AnalysisCtrlMessage>,
+    analyzer_config: AnalyzerConfig,
+    device: Device,
+    notification_channel: tokio::sync::mpsc::Sender<Notification>,
+    min_space_to_start_mb: u64,
+    min_space_to_continue_mb: u64,
+    gps_mode: GpsMode,
+    gps_fixed_coords: Option<(f64, f64)>,
+    state: DiagState,
+    max_type_seen: EventType,
+    bytes_since_space_check: usize,
+    low_space_warned: bool,
+    latest_packet_timestamp: Option<i64>,
+}
+
+enum DiagState {
+    Recording {
+        qmdl_writer: Box<QmdlWriter<File>>,
+        analysis_writer: Box<AnalysisWriter>,
+    },
+    Stopped,
+}
+
+enum DiskSpaceCheck {
+    Ok(u64),
+    Warning(u64),
+    Critical(u64),
+    Failed,
+}
+
+fn check_disk_space(path: &std::path::Path, warning_mb: u64, critical_mb: u64) -> DiskSpaceCheck {
+    match DiskStats::new(path.to_str().unwrap()) {
+        Ok(stats) => {
+            let available_mb = stats.available_bytes.unwrap_or(0) / 1024 / 1024;
+            if available_mb < critical_mb {
+                DiskSpaceCheck::Critical(available_mb)
+            } else if available_mb < warning_mb {
+                DiskSpaceCheck::Warning(available_mb)
+            } else {
+                DiskSpaceCheck::Ok(available_mb)
+            }
+        }
+        Err(e) => {
+            warn!("Failed to check disk space: {e}");
+            DiskSpaceCheck::Failed
+        }
+    }
+}
+
+impl DiagTask {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        ui_update_sender: Sender<display::DisplayState>,
+        analysis_sender: Sender<AnalysisCtrlMessage>,
+        analyzer_config: AnalyzerConfig,
+        device: Device,
+        notification_channel: tokio::sync::mpsc::Sender<Notification>,
+        min_space_to_start_mb: u64,
+        min_space_to_continue_mb: u64,
+        gps_mode: GpsMode,
+        gps_fixed_coords: Option<(f64, f64)>,
+    ) -> Self {
+        Self {
+            ui_update_sender,
+            analysis_sender,
+            analyzer_config,
+            device,
+            notification_channel,
+            min_space_to_start_mb,
+            min_space_to_continue_mb,
+            gps_mode,
+            gps_fixed_coords,
+            state: DiagState::Stopped,
+            max_type_seen: EventType::Informational,
+            bytes_since_space_check: 0,
+            low_space_warned: false,
+            latest_packet_timestamp: None,
+        }
+    }
+
+    /// Start recording, returning an error if disk space is too low.
+    async fn start(&mut self, qmdl_store: &mut RecordingStore) -> Result<(), RecordingStoreError> {
+        self.max_type_seen = EventType::Informational;
+        self.bytes_since_space_check = 0;
+        self.low_space_warned = false;
+
+        match check_disk_space(
+            &qmdl_store.path,
+            self.min_space_to_start_mb,
+            self.min_space_to_continue_mb,
+        ) {
+            DiskSpaceCheck::Critical(mb) | DiskSpaceCheck::Warning(mb) => {
+                return Err(RecordingStoreError::InsufficientDiskSpace(
+                    mb,
+                    self.min_space_to_start_mb,
+                ));
+            }
+            DiskSpaceCheck::Ok(mb) => {
+                info!("Starting recording with {}MB disk space available", mb);
+            }
+            DiskSpaceCheck::Failed => {}
+        }
+
+        let (qmdl_gz_file, analysis_file) = qmdl_store.new_entry(self.gps_mode).await?;
+
+        // For fixed-mode sessions, write the configured coordinates to the storage
+        // immediately so the per-session GPS is stored durably and isn't affected
+        // by future config changes or GPS API calls.
+        if self.gps_mode == GpsMode::Fixed
+            && let Some((lat, lon)) = self.gps_fixed_coords
+            && let Some((entry_idx, _)) = qmdl_store.get_current_entry()
+        {
+            let mut gps_file = qmdl_store
+                .open_entry_gps_for_append(entry_idx)
+                .await?
+                .ok_or(RecordingStoreError::GpsStorageNotFound)?;
+
+            let record = GpsRecord {
+                latest_packet_timestamp: None,
+                system_time: rayhunter::clock::get_adjusted_now().timestamp(),
+                lat,
+                lon,
+            };
+            let mut json = serde_json::to_vec(&record)?;
+            json.push(b'\n');
+            gps_file
+                .write_all(&json)
+                .await
+                .map_err(RecordingStoreError::WriteFileError)?;
+        }
+        self.stop_current_recording(qmdl_store).await;
+        let qmdl_writer = Box::new(QmdlWriter::new(qmdl_gz_file));
+        let device_metadata = DeviceMetadata {
+            home_plmn: rayhunter::sim::home_plmn(&self.device).await,
+        };
+        let analysis_writer =
+            AnalysisWriter::new(analysis_file, &self.analyzer_config, &device_metadata)
+                .await
+                .map_err(RecordingStoreError::WriteFileError)?;
+        self.state = DiagState::Recording {
+            qmdl_writer,
+            analysis_writer: Box::new(analysis_writer),
+        };
+
+        if let Err(e) = self
+            .ui_update_sender
+            .send(display::DisplayState::Recording)
+            .await
+        {
+            warn!("couldn't send ui update message: {e}");
+        }
+        Ok(())
+    }
+
+    /// Stop recording, optionally annotating the entry with a reason.
+    async fn stop(&mut self, qmdl_store: &mut RecordingStore, reason: Option<String>) {
+        self.stop_current_recording(qmdl_store).await;
+        if let Some(reason) = reason
+            && let Err(e) = qmdl_store.set_current_stop_reason(reason).await
+        {
+            warn!("couldn't set stop reason: {e}");
+        }
+        if let Some((_, entry)) = qmdl_store.get_current_entry()
+            && let Err(e) = self
+                .analysis_sender
+                .send(AnalysisCtrlMessage::RecordingFinished(
+                    entry.name.to_string(),
+                ))
+                .await
+        {
+            warn!("couldn't send analysis message: {e}");
+        }
+        if let Err(e) = qmdl_store.close_current_entry().await {
+            error!("couldn't close current entry: {e}");
+        }
+        if let Err(e) = self
+            .ui_update_sender
+            .send(display::DisplayState::Paused)
+            .await
+        {
+            warn!("couldn't send ui update message: {e}");
+        }
+    }
+
+    async fn delete_entry(
+        &mut self,
+        qmdl_store: &mut RecordingStore,
+        name: &str,
+    ) -> Result<(), RecordingStoreError> {
+        if qmdl_store.is_current_entry(name) {
+            self.stop(qmdl_store, None).await;
+        }
+        let res = qmdl_store.delete_entry(name).await;
+        if let Err(e) = res.as_ref() {
+            error!("Error deleting QMDL entry {e}");
+        }
+        res
+    }
+
+    async fn delete_all_entries(
+        &mut self,
+        qmdl_store: &mut RecordingStore,
+    ) -> Result<(), RecordingStoreError> {
+        self.stop(qmdl_store, None).await;
+        let res = qmdl_store.delete_all_entries().await;
+        if let Err(e) = res.as_ref() {
+            error!("Error deleting QMDL entries {e}");
+        }
+        res
+    }
+
+    async fn handle_gps_update(&mut self, qmdl_store: &RecordingStore, lat: f64, lon: f64) {
+        let Some((entry_idx, _)) = qmdl_store.get_current_entry() else {
+            info!("GPS update received but no recording active, not writing to storage");
+            return;
+        };
+        let mut file = match qmdl_store.open_entry_gps_for_append(entry_idx).await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                error!("GPS storage not found, cannot write GPS record");
+                return;
+            }
+            Err(e) => {
+                error!("failed to open GPS storage: {e}");
+                return;
+            }
+        };
+        let record = GpsRecord {
+            latest_packet_timestamp: self.latest_packet_timestamp,
+            system_time: rayhunter::clock::get_adjusted_now().timestamp(),
+            lat,
+            lon,
+        };
+        let Ok(mut json) = serde_json::to_vec(&record) else {
+            error!("failed to serialize GPS record");
+            return;
+        };
+        json.push(b'\n');
+        if let Err(e) = file.write_all(&json).await {
+            error!("failed to write GPS record to storage: {e}");
+        }
+    }
+
+    async fn stop_current_recording(&mut self, qmdl_store: &mut RecordingStore) {
+        let mut state = DiagState::Stopped;
+        std::mem::swap(&mut self.state, &mut state);
+        if let DiagState::Recording {
+            qmdl_writer,
+            analysis_writer,
+            ..
+        } = state
+        {
+            match (qmdl_writer.close().await, analysis_writer.close().await) {
+                (Ok(size), Ok(())) => {
+                    if let Err(err) = qmdl_store.update_current_entry_qmdl_size(size).await {
+                        error!("failed to update QMDL entry size while closing it: {err:?}");
+                    }
+                }
+                (qmdl_result, analysis_result) => {
+                    if let Err(err) = qmdl_result {
+                        error!("failed to close QmdlWriter: {err:?}");
+                    }
+                    if let Err(err) = analysis_result {
+                        error!("failed to close AnalysisWriter: {err:?}");
+                    }
+                    panic!();
+                }
+            }
+        }
+    }
+
+    async fn process_container(
+        &mut self,
+        qmdl_store: &mut RecordingStore,
+        container: MessagesContainer,
+    ) {
+        if container.data_type != DataType::UserSpace {
+            debug!("skipping non-userspace diag messages...");
+            return;
+        }
+        // keep track of how many bytes were written to the QMDL file so we can read
+        // a valid block of data from it in the HTTP server
+        if let DiagState::Recording {
+            qmdl_writer,
+            analysis_writer,
+        } = &mut self.state
+        {
+            if self.bytes_since_space_check >= DISK_CHECK_BYTES_INTERVAL {
+                self.bytes_since_space_check = 0;
+                match check_disk_space(
+                    &qmdl_store.path,
+                    self.min_space_to_start_mb,
+                    self.min_space_to_continue_mb,
+                ) {
+                    DiskSpaceCheck::Critical(mb) => {
+                        let reason = format!(
+                            "Disk space critically low ({}MB free), recording stopped automatically",
+                            mb
+                        );
+                        error!("{reason}");
+
+                        self.notification_channel
+                            .send(Notification::new(
+                                NotificationType::Warning,
+                                reason.clone(),
+                                None,
+                            ))
+                            .await
+                            .ok();
+
+                        self.stop(qmdl_store, Some(reason)).await;
+                        return;
+                    }
+                    DiskSpaceCheck::Warning(mb) if !self.low_space_warned => {
+                        self.low_space_warned = true;
+                        warn!("Disk space low: {}MB remaining", mb);
+                        self.notification_channel
+                            .send(Notification::new(
+                                NotificationType::Warning,
+                                format!("Disk space low: {}MB free", mb),
+                                Some(Duration::from_secs(30)),
+                            ))
+                            .await
+                            .ok();
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Err(e) = qmdl_writer.write_container(&container).await {
+                let reason = format!("failed to write to QMDL (disk full?): {e}");
+                error!("{reason}");
+                self.stop(qmdl_store, Some(reason)).await;
+                return;
+            }
+            if let Ok(file_size) = qmdl_writer.size().await {
+                debug!(
+                    "total QMDL bytes written: {}, updating manifest...",
+                    file_size
+                );
+                if let Err(e) = qmdl_store.update_current_entry_qmdl_size(file_size).await {
+                    let reason = format!("failed to update manifest (disk full?): {e}");
+                    error!("{reason}");
+                    self.stop(qmdl_store, Some(reason)).await;
+                    return;
+                }
+                debug!("done!");
+            }
+
+            // Extract the latest packet timestamp from this container
+            if let Some(ts) = container
+                .messages()
+                .into_iter()
+                .filter_map(|r| match r {
+                    Ok(Message::Log { timestamp, .. }) => Some(timestamp.to_datetime().timestamp()),
+                    _ => None,
+                })
+                .max()
+            {
+                self.latest_packet_timestamp = Some(ts);
+            }
+
+            let container_bytes: usize = container.messages.iter().map(|m| m.data.len()).sum();
+            self.bytes_since_space_check += container_bytes;
+            let max_type = match analysis_writer.analyze_container(container).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("failed to analyze container: {e}");
+                    EventType::Informational
+                }
+            };
+
+            if max_type > EventType::Informational {
+                info!("a heuristic triggered on this run!");
+                self.notification_channel
+                    .send(Notification::new(
+                        NotificationType::Warning,
+                        format!("Rayhunter has detected a {:?} severity event", max_type),
+                        Some(Duration::from_secs(60 * 5)),
+                    ))
+                    .await
+                    .expect("Failed to send to notification channel");
+            }
+
+            if max_type > self.max_type_seen {
+                self.max_type_seen = max_type;
+                if self.max_type_seen > EventType::Informational {
+                    self.ui_update_sender
+                        .send(display::DisplayState::WarningDetected {
+                            event_type: self.max_type_seen,
+                        })
+                        .await
+                        .expect("couldn't send ui update message: {}");
+                }
+            }
+        } else {
+            debug!("no qmdl_writer set, continuing...");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_diag_read_thread(
+    task_tracker: &TaskTracker,
+    device: Device,
+    mut qmdl_file_rx: Receiver<DiagDeviceCtrlMessage>,
+    qmdl_file_tx: Sender<DiagDeviceCtrlMessage>,
+    ui_update_sender: Sender<display::DisplayState>,
+    qmdl_store_lock: Arc<RwLock<RecordingStore>>,
+    analysis_sender: Sender<AnalysisCtrlMessage>,
+    analyzer_config: AnalyzerConfig,
+    notification_channel: tokio::sync::mpsc::Sender<Notification>,
+    min_space_to_start_mb: u64,
+    min_space_to_continue_mb: u64,
+    gps_mode: GpsMode,
+    gps_fixed_coords: Option<(f64, f64)>,
+) {
+    task_tracker.spawn(async move {
+        info!("Using configuration for device: {0:?}", device);
+        let mut dev = DiagDevice::new(&device)
+            .await?;
+        dev.config_logs()
+            .await?;
+
+        let mut diag_stream = pin!(dev.as_stream().into_stream());
+        let mut diag_task = DiagTask::new(
+            ui_update_sender,
+            analysis_sender,
+            analyzer_config,
+            device.clone(),
+            notification_channel,
+            min_space_to_start_mb,
+            min_space_to_continue_mb,
+            gps_mode,
+            gps_fixed_coords,
+        );
+        qmdl_file_tx
+            .send(DiagDeviceCtrlMessage::StartRecording { response_tx: None })
+            .await
+            .unwrap();
+        loop {
+            tokio::select! {
+                msg = qmdl_file_rx.recv() => {
+                    match msg {
+                        Some(DiagDeviceCtrlMessage::StartRecording { response_tx }) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            let result = diag_task.start(qmdl_store.deref_mut()).await;
+                            if let Some(tx) = response_tx {
+                                tx.send(result).ok();
+                            }
+                        },
+                        Some(DiagDeviceCtrlMessage::StopRecording) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.stop(qmdl_store.deref_mut(), None).await;
+                        },
+                        // None means all the Senders have been dropped, so it's
+                        // time to go
+                        Some(DiagDeviceCtrlMessage::Exit) | None => {
+                            info!("Diag reader thread exiting...");
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.stop_current_recording(qmdl_store.deref_mut()).await;
+                            return Ok(())
+                        },
+                        Some(DiagDeviceCtrlMessage::DeleteEntry { name, response_tx }) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            let resp = diag_task.delete_entry(qmdl_store.deref_mut(), name.as_str()).await;
+                            if response_tx.send(resp).is_err() {
+                                error!("Failed to send delete entry respons, receiver dropped");
+                            }
+                        },
+                        Some(DiagDeviceCtrlMessage::DeleteAllEntries { response_tx }) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            let resp = diag_task.delete_all_entries(qmdl_store.deref_mut()).await;
+                            if response_tx.send(resp).is_err() {
+                                error!("Failed to send delete all entries respons, receiver dropped");
+                            }
+                        },
+                        Some(DiagDeviceCtrlMessage::GpsUpdate { lat, lon }) => {
+                            let qmdl_store = qmdl_store_lock.read().await;
+                            diag_task.handle_gps_update(&qmdl_store, lat, lon).await;
+                        },
+                    }
+                }
+                maybe_container = diag_stream.next() => {
+                    match maybe_container.unwrap() {
+                        Ok(container) => {
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.process_container(qmdl_store.deref_mut(), container).await
+                        },
+                        Err(err) => {
+                            error!("error reading diag device: {err}");
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Start recording API for web thread
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    post,
+    path = "/api/start-recording",
+    tag = "Recordings",
+    responses(
+        (status = StatusCode::ACCEPTED, description = "Success"),
+        (status = StatusCode::FORBIDDEN, description = "System is in debug mode"),
+        (status = StatusCode::INTERNAL_SERVER_ERROR, description = "Recording action unsuccessful")
+    ),
+    summary = "Start recording",
+    description = "Begin a new data capture."
+))]
+pub async fn start_recording(
+    State(state): State<Arc<ServerState>>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    if state.config.debug_mode {
+        return Err((StatusCode::FORBIDDEN, "server is in debug mode".to_string()));
+    }
+
+    let (response_tx, response_rx) = oneshot::channel();
+    state
+        .diag_device_ctrl_sender
+        .send(DiagDeviceCtrlMessage::StartRecording {
+            response_tx: Some(response_tx),
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't send start recording message: {e}"),
+            )
+        })?;
+
+    match response_rx.await {
+        Ok(Ok(())) => Ok((StatusCode::ACCEPTED, "ok".to_string())),
+        Ok(Err(reason)) => Err((StatusCode::INSUFFICIENT_STORAGE, reason.to_string())),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to receive start recording response: {e}"),
+        )),
+    }
+}
+
+/// Stop recording API for web thread
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    post,
+    path = "/api/stop-recording",
+    tag = "Recordings",
+    responses(
+        (status = StatusCode::ACCEPTED, description = "Success"),
+        (status = StatusCode::FORBIDDEN, description = "System is in debug mode"),
+        (status = StatusCode::INTERNAL_SERVER_ERROR, description = "Recording action unsuccessful")
+    ),
+    summary = "Stop recording",
+    description = "Stop current data capture."
+))]
+pub async fn stop_recording(
+    State(state): State<Arc<ServerState>>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    if state.config.debug_mode {
+        return Err((StatusCode::FORBIDDEN, "server is in debug mode".to_string()));
+    }
+    state
+        .diag_device_ctrl_sender
+        .send(DiagDeviceCtrlMessage::StopRecording)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't send stop recording message: {e}"),
+            )
+        })?;
+    Ok((StatusCode::ACCEPTED, "ok".to_string()))
+}
+
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    post,
+    path = "/api/delete-recording/{name}",
+    tag = "Recordings",
+    responses(
+        (status = StatusCode::ACCEPTED, description = "Success"),
+        (status = StatusCode::FORBIDDEN, description = "System is in debug mode"),
+        (status = StatusCode::INTERNAL_SERVER_ERROR, description = "Delete action unsuccessful"),
+        (status = StatusCode::BAD_REQUEST, description = "Bad recording name or no such recording")
+    ),
+    params(
+        ("name" = String, Path, description = "QMDL file to delete")
+    ),
+    summary = "Delete recording",
+    description = "Remove data capture file named {name}."
+))]
+pub async fn delete_recording(
+    State(state): State<Arc<ServerState>>,
+    Path(qmdl_name): Path<String>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    if state.config.debug_mode {
+        return Err((StatusCode::FORBIDDEN, "server is in debug mode".to_string()));
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    state
+        .diag_device_ctrl_sender
+        .send(DiagDeviceCtrlMessage::DeleteEntry {
+            name: qmdl_name.clone(),
+            response_tx,
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't send delete entry message: {e}"),
+            )
+        })?;
+    match response_rx.await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to receive delete response: {e}"),
+        )
+    })? {
+        Ok(_) => Ok((StatusCode::ACCEPTED, "ok".to_string())),
+        Err(RecordingStoreError::NoSuchEntryError) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("no recording with name {qmdl_name}"),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("couldn't delete recording: {e}"),
+        )),
+    }
+}
+
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    post,
+    path = "/api/delete-all-recordings",
+    tag = "Recordings",
+    responses(
+        (status = StatusCode::ACCEPTED, description = "Success"),
+        (status = StatusCode::FORBIDDEN, description = "System is in debug mode"),
+        (status = StatusCode::INTERNAL_SERVER_ERROR, description = "Delete action unsuccessful")
+    ),
+    summary = "Delete all recordings",
+    description = "Remove all saved data capture files."
+))]
+pub async fn delete_all_recordings(
+    State(state): State<Arc<ServerState>>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    if state.config.debug_mode {
+        return Err((StatusCode::FORBIDDEN, "server is in debug mode".to_string()));
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    state
+        .diag_device_ctrl_sender
+        .send(DiagDeviceCtrlMessage::DeleteAllEntries { response_tx })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("couldn't send delete all entries message: {e}"),
+            )
+        })?;
+    match response_rx.await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to receive delete all response: {e}"),
+        )
+    })? {
+        Ok(_) => Ok((StatusCode::ACCEPTED, "ok".to_string())),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("couldn't delete recordings: {e}"),
+        )),
+    }
+}
+
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    get,
+    path = "/api/analysis-report/{name}",
+    tag = "Recordings",
+    responses(
+        (status = StatusCode::OK, description = "Success", body = ReportMetadata, content_type = "application/x-ndjson"),
+        (status = StatusCode::SERVICE_UNAVAILABLE, description = "No QMDL files available; start a new recording."),
+        (status = StatusCode::NOT_FOUND, description = "File {name} not found")
+    ),
+    params(
+        ("name" = String, Path, description = "QMDL file to analyze")
+    ),
+    summary = "Analysis report",
+    description = "Download processed analysis report for QMDL file {name}, as well as the types (and versions) of analyzers used."
+))]
+pub async fn get_analysis_report(
+    State(state): State<Arc<ServerState>>,
+    Path(qmdl_name): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    let qmdl_store = state.qmdl_store_lock.read().await;
+    let (entry_index, _) = if qmdl_name == "live" {
+        qmdl_store.get_current_entry().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No QMDL data's being recorded to analyze, try starting a new recording!".to_string(),
+        ))?
+    } else {
+        qmdl_store.entry_for_name(&qmdl_name).ok_or((
+            StatusCode::NOT_FOUND,
+            format!("Couldn't find QMDL entry with name \"{qmdl_name}\""),
+        ))?
+    };
+    let analysis_file = qmdl_store
+        .open_file(entry_index, FileKind::Analysis)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?
+        .ok_or((StatusCode::NOT_FOUND, "Analysis file not found".to_string()))?;
+
+    // Read and normalize the NDJSON file
+    let reader = BufReader::new(analysis_file);
+    let lines_stream = LinesStream::new(reader.lines());
+
+    let mut normalizer = AnalysisLineNormalizer::new();
+    let normalized_stream = lines_stream
+        .try_filter(|line| future::ready(!line.is_empty()))
+        .map_ok(move |line| normalizer.normalize_line(line));
+
+    let headers = [(CONTENT_TYPE, "application/x-ndjson")];
+    let body = Body::from_stream(normalized_stream);
+    Ok((headers, body).into_response())
+}

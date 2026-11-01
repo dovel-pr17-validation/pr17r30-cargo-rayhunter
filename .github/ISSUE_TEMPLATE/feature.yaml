@@ -1,0 +1,34 @@
+name: Feature Request
+description: Suggest a new feature or improvement to Rayhunter
+labels: ["enhancement"]
+body:
+  - type: checkboxes
+    attributes:
+      label: Prerequisites
+      options:
+        - label: I have read [CONTRIBUTING.md](https://github.com/EFForg/rayhunter/blob/main/CONTRIBUTING.md)
+          required: true
+        - label: No generative AI (including LLMs) tools were used to write this issue.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this feature solve or what does it enhance?
+      description: Explain what this feature addresses, ors the benefit it provides.
+      placeholder: For example, "Currently, users have to manually do X, which is time-consuming."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution you'd like to see implemented.
+      placeholder: For example, "Implement a new button that automatically does X."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you considered any alternative solutions?
+      placeholder: For example, "We considered Y, but Z is a better approach because..."

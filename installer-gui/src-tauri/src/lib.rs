@@ -1,0 +1,50 @@
+use std::sync::LazyLock;
+
+use clap::CommandFactory;
+use tauri::Emitter;
+
+mod introspect;
+mod modifiers;
+
+static INSTALLER_COMMAND: LazyLock<clap::Command> = LazyLock::new(installer::Args::command);
+
+async fn run_installer(app_handle: tauri::AppHandle, args: Vec<String>) -> anyhow::Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        installer::run_with_callback(
+            args,
+            Some(Box::new(move |output| {
+                app_handle
+                    .emit("installer-output", output)
+                    .expect("Error sending Rayhunter CLI installer output to GUI frontend");
+            })),
+        )
+    })
+    .await?
+}
+
+#[tauri::command]
+async fn install_rayhunter(app_handle: tauri::AppHandle, args: Vec<String>) -> Result<(), String> {
+    // the return value of tauri commands needs to be serializable by serde which we accomplish
+    // here by converting anyhow::Error to a string
+    run_installer(app_handle, args)
+        .await
+        .map_err(|error| format!("{error:?}"))
+}
+
+#[tauri::command]
+fn rayhunter_options() -> introspect::Command<'static> {
+    introspect::Command::new(&INSTALLER_COMMAND)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            install_rayhunter,
+            rayhunter_options
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

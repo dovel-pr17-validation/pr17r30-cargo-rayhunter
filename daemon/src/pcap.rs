@@ -1,0 +1,227 @@
+use crate::gps::{GpsRecord, load_gps_records};
+use crate::qmdl_store::FileKind;
+use crate::server::ServerState;
+
+use crate::config::GpsMode;
+use anyhow::Error;
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
+use log::error;
+use rayhunter::gsmtap::parser as gsmtap_parser;
+use rayhunter::pcap::{GpsPoint, GsmtapPcapWriter};
+use rayhunter::qmdl::QmdlMessageReader;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, duplex};
+use tokio_util::io::ReaderStream;
+
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    get,
+    path = "/api/pcap/{name}",
+    tag = "Recordings",
+    responses(
+        (status = StatusCode::OK, description = "PCAP conversion successful", content_type = "application/vnd.tcpdump.pcap"),
+        (status = StatusCode::NOT_FOUND, description = "Could not find file {name}"),
+        (status = StatusCode::SERVICE_UNAVAILABLE, description = "QMDL file is empty")
+    ),
+    params(
+        ("name" = String, Path, description = "QMDL filename to convert and download")
+    ),
+    summary = "Download a PCAP file",
+    description = "Stream a PCAP file to a client in chunks by converting the QMDL data for file {name} written so far."
+))]
+pub async fn get_pcap(
+    State(state): State<Arc<ServerState>>,
+    Path(mut qmdl_name): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    let qmdl_store = state.qmdl_store_lock.read().await;
+    if qmdl_name.ends_with("pcapng") {
+        qmdl_name = qmdl_name.trim_end_matches(".pcapng").to_string();
+    }
+    let (entry_index, entry) = qmdl_store.entry_for_name(&qmdl_name).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("couldn't find manifest entry with name {qmdl_name}"),
+    ))?;
+    if entry.qmdl_size_bytes == 0 {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "QMDL file is empty, try again in a bit!".to_string(),
+        ));
+    }
+    let qmdl_file = qmdl_store
+        .open_file(entry_index, FileKind::Qmdl)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?
+        .ok_or((StatusCode::NOT_FOUND, "QMDL file not found".to_string()))?;
+    let qmdl_reader = QmdlMessageReader::new(qmdl_file)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
+    let (reader, writer) = duplex(1024);
+    let gps_records = load_gps_records_for_entry(&state, entry_index).await;
+    drop(qmdl_store);
+
+    tokio::spawn(async move {
+        if let Err(e) = generate_pcap_data(writer, qmdl_reader, gps_records).await {
+            error!("failed to generate PCAP: {e:?}");
+        }
+    });
+
+    let headers = [(CONTENT_TYPE, "application/vnd.tcpdump.pcap")];
+    let body = Body::from_stream(ReaderStream::new(reader));
+    Ok((headers, body).into_response())
+}
+
+pub(crate) async fn load_gps_records_for_entry(
+    state: &Arc<ServerState>,
+    entry_index: usize,
+) -> Vec<GpsRecord> {
+    let qmdl_store = state.qmdl_store_lock.read().await;
+    match qmdl_store.open_file(entry_index, FileKind::Gps).await {
+        Ok(Some(file)) => load_gps_records(file).await,
+        Ok(None) => {
+            let gps_mode = qmdl_store
+                .manifest
+                .entries
+                .get(entry_index)
+                .and_then(|e| e.gps_mode);
+            if gps_mode.is_some_and(|m| m != GpsMode::Disabled) {
+                error!(
+                    "GPS storage expected for entry {entry_index} (mode: {gps_mode:?}) but not found"
+                );
+            }
+            vec![]
+        }
+        Err(e) => {
+            error!("failed to open GPS storage: {e}");
+            vec![]
+        }
+    }
+}
+
+fn record_timestamp(r: &GpsRecord) -> i64 {
+    r.latest_packet_timestamp.unwrap_or(i64::MIN)
+}
+
+fn find_nearest_gps(records: &[GpsRecord], packet_timestamp: i64) -> Option<GpsPoint> {
+    if records.is_empty() {
+        return None;
+    }
+    let idx = records.partition_point(|r| record_timestamp(r) <= packet_timestamp);
+    let record = if idx == 0 {
+        &records[0]
+    } else if idx >= records.len() {
+        &records[records.len() - 1]
+    } else {
+        let (before, after) = (&records[idx - 1], &records[idx]);
+        let before_delta = packet_timestamp - record_timestamp(before);
+        let after_delta = record_timestamp(after) - packet_timestamp;
+        if before_delta <= after_delta {
+            before
+        } else {
+            after
+        }
+    };
+    Some(GpsPoint {
+        latitude: record.lat,
+        longitude: record.lon,
+        unix_ts: record_timestamp(record),
+    })
+}
+
+pub async fn generate_pcap_data<R, W>(
+    writer: W,
+    mut reader: QmdlMessageReader<R>,
+    gps_records: Vec<GpsRecord>,
+) -> Result<(), Error>
+where
+    W: AsyncWrite + Unpin + Send,
+    R: AsyncRead + AsyncSeek + Unpin,
+{
+    let mut pcap_writer = GsmtapPcapWriter::new(writer).await?;
+    pcap_writer.write_iface_header().await?;
+
+    while let Some(maybe_msg) = reader.get_next_message().await? {
+        match maybe_msg {
+            Ok(msg) => {
+                let maybe_gsmtap_msg = gsmtap_parser::parse(msg)?;
+                if let Some((timestamp, gsmtap_msg)) = maybe_gsmtap_msg {
+                    let packet_unix_ts = timestamp.to_datetime().timestamp();
+                    let gps = find_nearest_gps(&gps_records, packet_unix_ts);
+                    pcap_writer
+                        .write_gsmtap_message(gsmtap_msg, timestamp, gps.as_ref())
+                        .await?;
+                }
+            }
+            Err(e) => error!("error parsing message: {e:?}"),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(latest_packet_timestamp: i64, lat: f64, lon: f64) -> GpsRecord {
+        GpsRecord {
+            latest_packet_timestamp: Some(latest_packet_timestamp),
+            system_time: 0,
+            lat,
+            lon,
+        }
+    }
+
+    #[test]
+    fn test_empty_returns_none() {
+        assert!(find_nearest_gps(&[], 100).is_none());
+    }
+
+    #[test]
+    fn test_single_record_always_returned() {
+        let records = vec![rec(100, 1.0, 2.0)];
+        assert_eq!(find_nearest_gps(&records, 0).unwrap().unix_ts, 100);
+        assert_eq!(find_nearest_gps(&records, 200).unwrap().unix_ts, 100);
+    }
+
+    #[test]
+    fn test_before_all_records_returns_first() {
+        let records = vec![rec(100, 1.0, 2.0), rec(200, 3.0, 4.0)];
+        assert_eq!(find_nearest_gps(&records, 50).unwrap().unix_ts, 100);
+    }
+
+    #[test]
+    fn test_after_all_records_returns_last() {
+        let records = vec![rec(100, 1.0, 2.0), rec(200, 3.0, 4.0)];
+        assert_eq!(find_nearest_gps(&records, 300).unwrap().unix_ts, 200);
+    }
+
+    #[test]
+    fn test_exact_match() {
+        let records = vec![rec(100, 1.0, 2.0), rec(200, 3.0, 4.0), rec(300, 5.0, 6.0)];
+        assert_eq!(find_nearest_gps(&records, 200).unwrap().unix_ts, 200);
+    }
+
+    #[test]
+    fn test_closer_to_before() {
+        // packet at 130: delta to before(100)=30, delta to after(200)=70 → picks before
+        let records = vec![rec(100, 1.0, 2.0), rec(200, 3.0, 4.0)];
+        assert_eq!(find_nearest_gps(&records, 130).unwrap().unix_ts, 100);
+    }
+
+    #[test]
+    fn test_closer_to_after() {
+        // packet at 170: delta to before(100)=70, delta to after(200)=30 → picks after
+        let records = vec![rec(100, 1.0, 2.0), rec(200, 3.0, 4.0)];
+        assert_eq!(find_nearest_gps(&records, 170).unwrap().unix_ts, 200);
+    }
+
+    #[test]
+    fn test_equidistant_prefers_before() {
+        // packet at 150: delta to before(100)=50, delta to after(200)=50 → tie, picks before
+        let records = vec![rec(100, 1.0, 2.0), rec(200, 3.0, 4.0)];
+        assert_eq!(find_nearest_gps(&records, 150).unwrap().unix_ts, 100);
+    }
+}

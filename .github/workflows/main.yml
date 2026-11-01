@@ -1,0 +1,700 @@
+name: main
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_call:  # required to call this workflow from another workflow like release.yml
+
+env:
+  CARGO_TERM_COLOR: always
+  FILE_ROOTSHELL: ../../rootshell/rootshell
+  FILE_RAYHUNTER_DAEMON: ../../rayhunter-daemon/rayhunter-daemon
+  FILE_WPA_SUPPLICANT: ../../wpa-supplicant/wpa_supplicant
+  FILE_WPA_CLI: ../../wpa-supplicant/wpa_cli
+  FILE_IW: ../../wpa-supplicant/iw
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  files_changed:
+    name: Detect file changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      code_changed: ${{ steps.files_changed.outputs.code_count != '0' }}
+      daemon_changed: ${{ steps.files_changed.outputs.daemon_count != '0' }}
+      daemon_needed: ${{ steps.files_changed.outputs.daemon_count != '0' || steps.files_changed.outputs.installer_build != '0' }}
+      web_changed: ${{ steps.files_changed.outputs.web_count != '0' }}
+      docs_changed: ${{ steps.files_changed.outputs.docs_count != '0' || steps.files_changed.outputs.daemon_count != '0' }}
+      installer_build: ${{ steps.files_changed.outputs.installer_build != '0' }}
+      installer_changed: ${{ steps.files_changed.outputs.installer_count != '0' }}
+      installer_gui_changed: ${{ steps.files_changed.outputs.installer_gui_count != '0' }}
+      rootshell_needed: ${{ steps.files_changed.outputs.rootshell_count != '0' || steps.files_changed.outputs.installer_build != '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: detect file changes
+        id: files_changed
+        run: |
+          lcommit=${{ github.event.pull_request.base.sha || 'origin/main' }}
+
+          # We rebuild everything if any of these conditions hold:
+          # * We are on main
+          # * The run was triggered by a tag
+          # * Changes are made to github workflows
+          # * A cargo-workspace file changed (lockfile, .cargo, or the pinned toolchain), as that could affect any crate anywhere
+          # * Something from the script or dist folder changed (could be gated to installer, but some scripts like build_wpa_supplicant are part of the build process)
+          # * #build-all was used by the user to explicitly ask for this
+          if [ ${GITHUB_REF} = 'refs/heads/main' ] || [ ${GITHUB_REF_TYPE} = 'tag' ] || git diff --name-only $lcommit..HEAD | grep -qe ^.github/workflows/ -e ^.cargo -e '^Cargo\.lock$' -e '^Cargo\.toml$' -e '^rust-toolchain\.toml$' -e ^dist/ -e ^scripts/ || git log -1 --format='%s %b' | grep -qF '#build-all'
+          then
+            echo "building everything"
+            echo code_count=forced >> "$GITHUB_OUTPUT"
+            echo daemon_count=forced >> "$GITHUB_OUTPUT"
+            echo web_count=forced >> "$GITHUB_OUTPUT"
+            echo docs_count=forced >> "$GITHUB_OUTPUT"
+            echo installer_build=forced >> "$GITHUB_OUTPUT"
+            echo installer_count=forced >> "$GITHUB_OUTPUT"
+            echo installer_gui_count=forced >> "$GITHUB_OUTPUT"
+            echo rootshell_count=forced >> "$GITHUB_OUTPUT"
+          else
+            echo "code_count=$(git diff --name-only $lcommit...HEAD | grep -e ^daemon -e ^installer -e ^check -e ^lib -e ^rootshell -e ^telcom-parser | wc -l)" >> "$GITHUB_OUTPUT"
+            echo "daemon_count=$(git diff --name-only $lcommit...HEAD | grep -e ^daemon -e ^lib -e ^telcom-parser | wc -l)" >> "$GITHUB_OUTPUT"
+            echo "web_count=$(git diff --name-only $lcommit...HEAD | grep -e ^daemon/web -e '^package-lock\.json$' | wc -l)" >> "$GITHUB_OUTPUT"
+            echo "docs_count=$(git diff --name-only $lcommit...HEAD | grep -e ^book.toml -e ^doc | wc -l)" >> "$GITHUB_OUTPUT"
+            echo "rootshell_count=$(git diff --name-only $lcommit...HEAD | grep -e ^rootshell | wc -l)" >> "$GITHUB_OUTPUT"
+
+            installer_count=$(git diff --name-only $lcommit...HEAD | grep -e ^installer/ | wc -l)
+            installer_gui_count=$(git diff --name-only $lcommit...HEAD | grep -e ^installer-gui -e '^package-lock\.json$' | wc -l)
+
+            if [ $installer_count != "0" ] || [ $installer_gui_count != "0" ]; then
+              echo "installer_build=1" >> "$GITHUB_OUTPUT"
+            else
+              echo "installer_build=0" >> "$GITHUB_OUTPUT"
+            fi
+
+            echo "installer_count=$installer_count" >> "$GITHUB_OUTPUT"
+            echo "installer_gui_count=$installer_gui_count" >> "$GITHUB_OUTPUT"
+          fi
+
+  mdbook_test:
+    name: Test mdBook Documentation builds
+    needs: files_changed
+    if: needs.files_changed.outputs.docs_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook
+        run: |
+          cargo install mdbook --no-default-features --features search --vers "^0.4" --locked
+      - name: Test mdBook
+        run: mdbook test
+
+  mdbook_build:
+    name: Build mdBook for Github Pages
+    needs: mdbook_test
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook
+        run: |
+          cargo install mdbook --no-default-features --features search --vers "^0.4" --locked
+
+      - name: Build mdBook
+        run: mdbook build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: book
+          path: book
+
+  check_and_test:
+    needs: files_changed
+    if: needs.files_changed.outputs.code_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Install pinned Rust toolchain
+      run: rustup toolchain install
+    - uses: Swatinem/rust-cache@v2
+    - name: Check formatting
+      run: cargo fmt --all --check
+    - name: Check
+      run: |
+        npm ci
+        npm run build -w daemon/web
+        cargo check --verbose
+    - name: Run tests
+      run: |
+        cargo test --verbose
+    - name: Run clippy
+      run: |
+        cargo clippy --verbose
+
+  installer_gui_check:
+    # we test the GUI installer separately to:
+    # 1) mimic the default behavior of cargo commands for rayhunter devs where
+    #    installer-gui isn't one of the default workspace packages
+    # 2) avoid slowing down development on changes unrelated to the GUI installer
+    needs: files_changed
+    if: needs.files_changed.outputs.installer_gui_changed == 'true'
+    # we run this on macos simply because no additional OS packages need to be
+    # installed
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Install pinned Rust toolchain
+      run: rustup toolchain install
+    - uses: Swatinem/rust-cache@v2
+      with:
+        # Workaround for https://github.com/Swatinem/rust-cache/issues/341
+        cache-bin: 'false'
+    # we don't need to run cargo fmt here because both cargo fmt and cargo
+    # fmt --all runs on all workspace packages so this is handled by
+    # check_and_test above
+    - name: Check
+      run: cargo check --package installer-gui --verbose
+    - name: Run clippy
+      run: cargo clippy --package installer-gui --verbose
+
+  test_daemon_frontend:
+    needs: files_changed
+    if: needs.files_changed.outputs.web_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: npm ci
+      - run: npm run lint -w daemon/web
+      - run: npm run check -w daemon/web
+      - run: npm run test -w daemon/web
+
+  test_installer_frontend:
+    needs: files_changed
+    if: needs.files_changed.outputs.installer_gui_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: npm ci
+      - run: npm run lint -w installer-gui
+      - run: npm run check -w installer-gui
+
+  windows_installer_check_and_test:
+    needs: files_changed
+    if: needs.files_changed.outputs.installer_changed == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        shell: bash
+        run: |
+          cd installer
+          cargo check --verbose
+      - name: cargo test
+        shell: bash
+        run: |
+          cd installer
+          cargo test --verbose --no-default-features
+
+  build_rayhunter_check:
+    if: needs.files_changed.outputs.daemon_changed == 'true'
+    needs:
+      - check_and_test
+      - files_changed
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        platform:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-musleabi
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - name: macos-arm
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-intel
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.platform.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Workaround for https://github.com/Swatinem/rust-cache/issues/341
+          cache-bin: 'false'
+      - name: Build rayhunter-check
+        run: cargo build --bin rayhunter-check --release --target ${{ matrix.platform.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rayhunter-check-${{ matrix.platform.name }}
+          path: target/${{ matrix.platform.target }}/release/rayhunter-check${{ matrix.platform.os == 'windows-latest' && '.exe' || '' }}
+          if-no-files-found: error
+
+  build_rootshell:
+    if: needs.files_changed.outputs.rootshell_needed == 'true'
+    needs:
+      - check_and_test
+      - files_changed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add Rust target
+        run: rustup target add armv7-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Build rootshell (armv7)
+        run: cargo build -p rootshell --bin rootshell --target armv7-unknown-linux-musleabihf --profile=firmware
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootshell
+          path: target/armv7-unknown-linux-musleabihf/firmware/rootshell
+          if-no-files-found: error
+
+  build_wpa_supplicant:
+    if: needs.files_changed.outputs.installer_build == 'true'
+    needs:
+      - files_changed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
+      - name: Build wpa_supplicant (armv7)
+        run: CC=arm-linux-gnueabihf-gcc STRIP=arm-linux-gnueabihf-strip HOST=arm-linux-gnueabihf scripts/build-wpa-supplicant.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wpa-supplicant
+          path: |
+            tools/build-wpa-supplicant/out/wpa_supplicant
+            tools/build-wpa-supplicant/out/wpa_cli
+            tools/build-wpa-supplicant/out/iw
+          if-no-files-found: error
+
+  build_rayhunter:
+    if: needs.files_changed.outputs.daemon_needed == 'true'
+    needs:
+      - check_and_test
+      - files_changed
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build frontend
+        run: |
+          npm ci
+          npm run build -w daemon/web
+      - name: Cache musl-cross toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo-musl-cross
+            ~/.rustup-musl-cross
+          key: musl-cross-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: musl-cross-
+      - name: Build rayhunter-daemon (armv7)
+        # Cross-compile inside messense/rust-musl-cross, which bundles an
+        # arm-linux-musleabihf cross gcc that aws-lc-sys needs.
+        #
+        # RUSTUP_HOME is bind-mounted because the image's own /root/.rustup
+        # isn't writable by the unprivileged user we run as.
+        run: |
+          mkdir -p "$HOME/.cargo-musl-cross" "$HOME/.rustup-musl-cross"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD":/work \
+            -v "$HOME/.cargo-musl-cross":/cargo-home \
+            -v "$HOME/.rustup-musl-cross":/rustup-home \
+            -e CARGO_HOME=/cargo-home \
+            -e RUSTUP_HOME=/rustup-home \
+            -w /work \
+            messense/rust-musl-cross:armv7-musleabihf \
+            sh -c 'rustup target add armv7-unknown-linux-musleabihf && cargo build-daemon-firmware'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rayhunter-daemon
+          path: target/armv7-unknown-linux-musleabihf/firmware/rayhunter-daemon
+          if-no-files-found: error
+
+  build_rust_installer:
+    if: needs.files_changed.outputs.installer_changed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - build_rayhunter
+      - build_rootshell
+      - build_wpa_supplicant
+      - files_changed
+      - windows_installer_check_and_test
+    strategy:
+      matrix:
+        platform:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-musleabi
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - name: macos-arm
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-intel
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.platform.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Workaround for https://github.com/Swatinem/rust-cache/issues/341
+          cache-bin: 'false'
+      - run: cargo build --package installer --bin installer --release --target ${{ matrix.platform.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.platform.name }}
+          path: target/${{ matrix.platform.target }}/release/installer${{ matrix.platform.os == 'windows-latest' && '.exe' || '' }}
+          if-no-files-found: error
+
+  build_installer_gui_linux:
+    if: needs.files_changed.outputs.installer_gui_changed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - build_rayhunter
+      - build_rootshell
+      - build_wpa_supplicant
+      - files_changed
+      - installer_gui_check
+      - test_installer_frontend
+    strategy:
+      matrix:
+        platform:
+          # we want to use the oldest supported version of ubuntu here to
+          # maximize compatibility with older versions of glibc
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.platform.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tauri dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev xdg-utils
+      - name: Build GUI installer
+        shell: bash
+        run: |
+          npm ci
+          npm run tauri build -w installer-gui -- --target ${{ matrix.platform.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-installer-${{ matrix.platform.name }}-appimage
+          path: target/${{ matrix.platform.target }}/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-installer-${{ matrix.platform.name }}-deb
+          path: target/${{ matrix.platform.target }}/release/bundle/deb/*.deb
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-installer-${{ matrix.platform.name }}-rpm
+          path: target/${{ matrix.platform.target }}/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+
+  build_installer_gui_macos:
+    if: needs.files_changed.outputs.installer_gui_changed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - build_rayhunter
+      - build_rootshell
+      - build_wpa_supplicant
+      - files_changed
+      - installer_gui_check
+      - test_installer_frontend
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Workaround for https://github.com/Swatinem/rust-cache/issues/341
+          # bin caching breaks cargo resolution on macOS 15 runner images
+          cache-bin: 'false'
+      - name: Build GUI installer
+        env:
+          TARGET: universal-apple-darwin
+        shell: bash
+        run: |
+          npm ci
+          npm run tauri build -w installer-gui -- --target "$TARGET"
+          mv "target/$TARGET/release/bundle/macos/"*.app .
+          zip -r "rayhunter-installer-macos.app.zip" ./*.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-installer-macos-app
+          path: ./*.app.zip
+          if-no-files-found: error
+
+  build_installer_gui_windows:
+    if: needs.files_changed.outputs.installer_gui_changed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - build_rayhunter
+      - build_rootshell
+      - build_wpa_supplicant
+      - files_changed
+      - installer_gui_check
+      - test_installer_frontend
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add Rust target
+        run: rustup target add ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build GUI installer
+        shell: bash
+        run: |
+          npm ci
+          npm run tauri build -w installer-gui -- --target ${{ env.TARGET }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-installer-msi
+          path: target/${{ env.TARGET }}/release/bundle/msi/*.msi
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-installer-exe
+          path: target/${{ env.TARGET }}/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  build_release_zip:
+    permissions:
+      contents: read
+      packages: write
+    needs:
+      - build_rayhunter_check
+      - build_rootshell
+      - build_rayhunter
+      - build_rust_installer
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform:
+          - linux-x64
+          - linux-aarch64
+          - linux-armv7
+          - macos-intel
+          - macos-arm
+          - windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+      - name: Fix executable permissions on binaries
+        run: chmod +x installer-*/installer rayhunter-check-*/rayhunter-check rayhunter-daemon/rayhunter-daemon
+      - name: Get Rayhunter version
+        id: get_version
+        run: echo "VERSION=$(grep '^version' daemon/Cargo.toml | head -n 1 | cut -d'"' -f2)" >> $GITHUB_ENV
+      - name: Setup versioned release directory
+        run: |
+          platform="${{ matrix.platform }}"
+          dest="rayhunter-v${VERSION}-${{ matrix.platform }}"
+          mkdir "$dest"
+          # Handle installer with proper extension for Windows
+          if [ "$platform" = "windows-x86_64" ]; then
+            mv installer-$platform/installer.exe "$dest"/installer.exe
+          else
+            mv installer-$platform/installer "$dest"/installer
+          fi
+          cp -r rayhunter-check-* rayhunter-daemon dist/scripts "$dest"/
+          zip -r "$dest.zip" "$dest"
+          sha256sum "$dest.zip" > "$dest.zip.sha256"
+
+      - name: Upload zip release and sha256
+        uses: actions/upload-artifact@v4
+        with:
+          name: rayhunter-v${{ env.VERSION }}-${{ matrix.platform }}
+          path: |
+            rayhunter-v${{ env.VERSION }}-${{ matrix.platform }}.zip
+            rayhunter-v${{ env.VERSION }}-${{ matrix.platform }}.zip.sha256
+          if-no-files-found: error
+
+  openapi_build:
+    if: needs.files_changed.outputs.docs_changed == 'true'
+    needs:
+      - files_changed
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Add Rust target
+        run: rustup target add armv7-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Build rayhunter-daemon openapi docs
+        run: |
+          mkdir -p daemon/web/build
+          touch daemon/web/build/{favicon.png,index.html.gz,rayhunter_orca_only.png,rayhunter_text.png}
+          cargo run --bin gen_api --features apidocs -- ./rayhunter-openapi.json
+      - name: Make swagger folder
+        run: |
+          mkdir api-docs
+          mv doc/swagger-ui.html api-docs/index.html
+          mv rayhunter-openapi.json api-docs/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-docs
+          path: api-docs
+
+  github_pages_stage:
+    name: Stage Github Pages artifact
+    permissions: {}
+    needs:
+      - mdbook_build
+      - openapi_build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+      - uses: actions/download-artifact@v4
+      - name: Organize pages into directory
+        run: cp -a api-docs book/
+      - name: Upload pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: book
+
+  github_pages_publish:
+    name: Deploy documentation to Github Pages
+    if: ${{ github.ref == 'refs/heads/main' }}
+    needs:
+      - github_pages_stage
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Github Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
