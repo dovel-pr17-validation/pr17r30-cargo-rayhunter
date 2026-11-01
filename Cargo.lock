@@ -207,9 +207,9 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "asn1-codecs"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eb148e3886345ed6c20c984393359bfda8220c82114ac5d12fcd54c0f393e91"
+checksum = "65f48d56acf2166241cab989a4d356c9bf50ddbbd3733ba5725dbdf579e94767"
 dependencies = [
  "bitvec",
  "log",
@@ -219,9 +219,9 @@ dependencies = [
 
 [[package]]
 name = "asn1-compiler"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a0ab1fb91f80ed8e751a8cb3d38dc822031dbfb769731e9d4a8bc184a39a230"
+checksum = "b6f9b64c8cf0a213ff6fa91270a6b520013135b1a9936b28f47b91fc19357e6a"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -238,9 +238,9 @@ dependencies = [
 
 [[package]]
 name = "asn1_codecs_derive"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "129a9f02b40e743766102dbbb93464b5868fb5e264a02a10d87fb45c472dd4b7"
+checksum = "578cabff8e9458470d7018b539e905b9385bfa38bad68de0e5c3f60088717504"
 dependencies = [
  "asn1-codecs",
  "bitvec",
